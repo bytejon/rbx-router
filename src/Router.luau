@@ -1,48 +1,88 @@
 type callback = (...any) -> (...any)
+local bridge = script:WaitForChild("Bridge")
 local http = game:GetService("HttpService")
-local json_encode = function(data: any): string
-	return http:JSONEncode(data)
-end
-local json_decode = function(data: string): any
-	return http:JSONDecode(data)
-end
-local link = {}
+local is_server = game:GetService("RunService"):IsServer()
 
-function link:send(data: string): nil
-	script:SetAttribute(self.OUT, json_encode(data))
+local set_attr = function(action: string, key: string, scope: any, value: any?)
+	local key = `_{key}_{scope}_`
+	if is_server then
+		if action == "set" then
+			script:SetAttribute(key, value)
+		elseif action == "inc" then
+			script:SetAttribute(key, (script:GetAttribute(key) or 1) + 1)
+		end
+	else
+		bridge:FireServer(action, key, value)
+	end
+end
+
+if is_server then
+	bridge.OnServerEvent:Connect(function(_, action: string, key: string, data: any)
+		if action == "set" then
+			script:SetAttribute(key, data)
+		elseif action == "inc" then
+			script:SetAttribute(key, (script:GetAttribute(key) or 1) + 1)
+		elseif action == "send" then
+			task.wait() -- will only send last message in single frame without this
+			script:SetAttribute(key, http:JSONEncode(data))
+		end
+	end)
+end
+
+local conn = {}
+
+function conn:send(data: any?): nil
+	if is_server then
+		task.wait() -- will only send last message in single frame without this
+		script:SetAttribute(self.OUT, http:JSONEncode(data))
+	else
+		bridge:FireServer("send", self.OUT, data)
+	end
 	return nil
 end
 
-function link:listen(code: callback): callback
-	local conn = self.signal:Connect(function()
-		local attr = json_decode(script:GetAttribute(self.IN))
-		if attr ~= "" then code(attr) end
+function conn:close(): nil
+	self.conn:Disconnect()
+	return nil
+end
+
+export type Connection = typeof(conn)
+
+local router = {}
+
+function router.create(key: string, size: number, code: callback): Connection
+	local self = table.clone(conn)
+	self.OUT = `_{key}_2_`
+	self.IN = `_{key}_3_`
+	local count = script:GetAttribute(`_{key}_1_`)
+	if not count then
+		set_attr("set", key, 0, size)
+		set_attr("set", key, 1, 1)
+	elseif count <= size then
+		set_attr("inc", key, 1)
+	end
+	self.conn = script:GetAttributeChangedSignal(self.IN):Connect(function()
+		code(http:JSONDecode(script:GetAttribute(self.IN)))
 	end)
-	return function() conn:Disconnect() end
-end
-
-export type Link = typeof(link)
-
-local module = {}
-
-function module.host(key: string): Link
-	local self = table.clone(link)
-	self.OUT = `_{key}_0_`
-	self.IN = `_{key}_1_`
-	self.signal = script:GetAttributeChangedSignal(self.IN)
-	task.defer(script.SetAttribute, script, self.OUT, '""')
-	task.defer(script.SetAttribute, script, self.IN, '""')
 	return self
 end
 
-function module.connect(key: string): Link
-	local data = script:GetAttribute(`_{key}_1_`)
-			  or script:GetAttributeChangedSignal(`_{key}_1_`):Wait()
-	local self = table.clone(link)
-	self.OUT = `_{key}_1_`
-	self.IN = `_{key}_0_`
-	self.signal = script:GetAttributeChangedSignal(self.IN)
+function router.connect(key: string, code: callback): Connection
+	local hosts = script:GetAttribute(`_{key}_0_`)
+	if not hosts or script:GetAttribute(`_{key}_1_`) < hosts then
+		local signal = script:GetAttributeChangedSignal(`_{key}_1_`)
+		repeat
+			signal:Wait()
+		until
+			(script:GetAttribute(`_{key}_1_`) or 0) >= script:GetAttribute(`_{key}_0_`)
+	end
+	local self = table.clone(conn)
+	self.OUT = `_{key}_3_`
+	self.IN = `_{key}_2_`
+	self.conn = script:GetAttributeChangedSignal(self.IN):Connect(function()
+		code(http:JSONDecode(script:GetAttribute(self.IN)))
+	end)
 	return self
 end
 
-return module
+return router
